@@ -11,7 +11,7 @@ online-softmax trick used again in the final attention kernel, and the
 attention kernel fuses QK^T + softmax + the weighted sum over V into a
 single pass that never materializes the full attention matrix.
 
-4379801956 What I've have: 
+What I've have: 
 
 ```
 kernels/
@@ -27,7 +27,7 @@ results/
 Makefile                            # local build, if you have a CUDA-capable machine
 ```
 
-4379801956 How to run it
+How to run it
 
 **Colab (no local GPU needed):** open `notebooks/cuda_kernels_colab.ipynb` in
 Google Colab, set the runtime to a GPU (T4 on the free tier), and run the
