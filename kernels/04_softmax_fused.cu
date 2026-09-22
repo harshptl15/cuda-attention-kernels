@@ -11,6 +11,9 @@
 #include <cstdlib>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <chrono>
+#include <vector>
 
 #define CUDA_CHECK(call)                                                     \
     do {                                                                     \
@@ -21,6 +24,54 @@
             exit(EXIT_FAILURE);                                              \
         }                                                                    \
     } while (0)
+
+// --- Timing harness -------------------------------------------------------
+// A T4 idles at P8 with its SM clock parked at 300 MHz and needs on the order
+// of a second of sustained load to reach boost. A fixed launch-count warmup is
+// nowhere near enough, and the error is large: this project's attention kernel
+// measured 5.996 ms when it ran straight after an nvcc compile (GPU cold) and
+// 2.469 ms run back-to-back with the other benchmarks (GPU hot) -- a 2.4x
+// swing from the identical binary on the identical input. cuBLAS on the same
+// machine ranged over 3072-6160 GFLOP/s for the same reason.
+//
+// So: warm up by wall-clock time rather than by launch count, and report the
+// median of several timed blocks plus the observed spread, so a run that is
+// still unstable says so in its own output instead of looking authoritative.
+#define WARMUP_MS 1500.0
+#define ITERS     20
+#define REPEATS   5
+
+template <typename LaunchFn>
+static float benchmarkMs(LaunchFn launch, float* spreadPct) {
+    auto t0 = std::chrono::steady_clock::now();
+    do {
+        launch();
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } while (std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t0).count() < WARMUP_MS);
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    std::vector<float> samples;
+    for (int r = 0; r < REPEATS; ++r) {
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < ITERS; ++i) launch();
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        samples.push_back(ms / ITERS);
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    std::sort(samples.begin(), samples.end());
+    float median = samples[REPEATS / 2];
+    if (spreadPct) *spreadPct = 100.0f * (samples.back() - samples.front()) / median;
+    return median;
+}
 
 #define WARP_SIZE 32
 
@@ -105,16 +156,11 @@ int main() {
     int threadsPerBlock = warpsPerBlock * WARP_SIZE;
     int blocks = (ROWS + warpsPerBlock - 1) / warpsPerBlock;
 
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start));
-    softmaxFusedWarp<<<blocks, threadsPerBlock>>>(d_in, d_out, ROWS, COLS);
+    float msSpread = 0.0f;
+    float ms = benchmarkMs([&]{
+        softmaxFusedWarp<<<blocks, threadsPerBlock>>>(d_in, d_out, ROWS, COLS);
+    }, &msSpread);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
 
     CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
     softmaxCPU(h_in, h_ref, ROWS, COLS);
@@ -127,7 +173,8 @@ int main() {
     double gbps = gbMoved / (ms / 1000.0);
 
     printf("Rows x Cols = %d x %d\n", ROWS, COLS);
-    printf("Fused softmax time: %.3f ms\n", ms);
+    printf("Fused softmax time: %.3f ms  [median of %d, spread %.1f%%]\n",
+           ms, REPEATS, msSpread);
     printf("Approx bandwidth: %.2f GB/s\n", gbps);
     printf("Max error vs CPU: %e\n", maxErr);
     printf(maxErr < 1e-4 ? "PASSED\n" : "FAILED\n");

@@ -12,6 +12,9 @@
 #include <cstdlib>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <chrono>
+#include <vector>
 
 #define CUDA_CHECK(call)                                                     \
     do {                                                                     \
@@ -22,6 +25,54 @@
             exit(EXIT_FAILURE);                                              \
         }                                                                    \
     } while (0)
+
+// --- Timing harness -------------------------------------------------------
+// A T4 idles at P8 with its SM clock parked at 300 MHz and needs on the order
+// of a second of sustained load to reach boost. A fixed launch-count warmup is
+// nowhere near enough, and the error is large: this project's attention kernel
+// measured 5.996 ms when it ran straight after an nvcc compile (GPU cold) and
+// 2.469 ms run back-to-back with the other benchmarks (GPU hot) -- a 2.4x
+// swing from the identical binary on the identical input. cuBLAS on the same
+// machine ranged over 3072-6160 GFLOP/s for the same reason.
+//
+// So: warm up by wall-clock time rather than by launch count, and report the
+// median of several timed blocks plus the observed spread, so a run that is
+// still unstable says so in its own output instead of looking authoritative.
+#define WARMUP_MS 1500.0
+#define ITERS     20
+#define REPEATS   5
+
+template <typename LaunchFn>
+static float benchmarkMs(LaunchFn launch, float* spreadPct) {
+    auto t0 = std::chrono::steady_clock::now();
+    do {
+        launch();
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } while (std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t0).count() < WARMUP_MS);
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    std::vector<float> samples;
+    for (int r = 0; r < REPEATS; ++r) {
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < ITERS; ++i) launch();
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        samples.push_back(ms / ITERS);
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    std::sort(samples.begin(), samples.end());
+    float median = samples[REPEATS / 2];
+    if (spreadPct) *spreadPct = 100.0f * (samples.back() - samples.front()) / median;
+    return median;
+}
 
 #define TILE 16
 
@@ -96,27 +147,19 @@ int main() {
     dim3 grid((N + TILE - 1) / TILE, (N + TILE - 1) / TILE);
 
     // --- naive ---
-    cudaEvent_t s1, e1;
-    CUDA_CHECK(cudaEventCreate(&s1)); CUDA_CHECK(cudaEventCreate(&e1));
-    CUDA_CHECK(cudaEventRecord(s1));
-    matmulNaive<<<grid, block>>>(d_A, d_B, d_C, N);
+    float msNaiveSpread = 0.0f;
+    float msNaive = benchmarkMs([&]{
+        matmulNaive<<<grid, block>>>(d_A, d_B, d_C, N);
+    }, &msNaiveSpread);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(e1));
-    CUDA_CHECK(cudaEventSynchronize(e1));
-    float msNaive = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&msNaive, s1, e1));
     CUDA_CHECK(cudaMemcpy(h_C_naive, d_C, bytes, cudaMemcpyDeviceToHost));
 
     // --- tiled ---
-    cudaEvent_t s2, e2;
-    CUDA_CHECK(cudaEventCreate(&s2)); CUDA_CHECK(cudaEventCreate(&e2));
-    CUDA_CHECK(cudaEventRecord(s2));
-    matmulTiled<<<grid, block>>>(d_A, d_B, d_C, N);
+    float msTiledSpread = 0.0f;
+    float msTiled = benchmarkMs([&]{
+        matmulTiled<<<grid, block>>>(d_A, d_B, d_C, N);
+    }, &msTiledSpread);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(e2));
-    CUDA_CHECK(cudaEventSynchronize(e2));
-    float msTiled = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&msTiled, s2, e2));
     CUDA_CHECK(cudaMemcpy(h_C_tiled, d_C, bytes, cudaMemcpyDeviceToHost));
 
     // Tiled should match naive (both should match a CPU reference too, but
@@ -130,8 +173,10 @@ int main() {
     double gflopsTiled = (2.0 * N * N * N) / (msTiled / 1000.0) / 1e9;
 
     printf("N = %d x %d, TILE = %d\n", N, N, TILE);
-    printf("Naive : %.3f ms  (%.2f GFLOP/s)\n", msNaive, gflopsNaive);
-    printf("Tiled : %.3f ms  (%.2f GFLOP/s)\n", msTiled, gflopsTiled);
+    printf("Naive : %.3f ms  (%.2f GFLOP/s)  [median of %d, spread %.1f%%]\n",
+           msNaive, gflopsNaive, REPEATS, msNaiveSpread);
+    printf("Tiled : %.3f ms  (%.2f GFLOP/s)  [median of %d, spread %.1f%%]\n",
+           msTiled, gflopsTiled, REPEATS, msTiledSpread);
     printf("Speedup: %.2fx\n", msNaive / msTiled);
     printf("Max diff naive vs tiled: %e\n", maxDiff);
     printf(maxDiff < 1e-2 ? "PASSED (naive and tiled agree)\n" : "FAILED (results diverge)\n");

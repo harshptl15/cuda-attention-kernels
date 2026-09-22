@@ -16,6 +16,9 @@
 #include <cstdlib>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <chrono>
+#include <vector>
 
 #define CUDA_CHECK(call)                                                     \
     do {                                                                     \
@@ -26,6 +29,54 @@
             exit(EXIT_FAILURE);                                              \
         }                                                                    \
     } while (0)
+
+// --- Timing harness -------------------------------------------------------
+// A T4 idles at P8 with its SM clock parked at 300 MHz and needs on the order
+// of a second of sustained load to reach boost. A fixed launch-count warmup is
+// nowhere near enough, and the error is large: this project's attention kernel
+// measured 5.996 ms when it ran straight after an nvcc compile (GPU cold) and
+// 2.469 ms run back-to-back with the other benchmarks (GPU hot) -- a 2.4x
+// swing from the identical binary on the identical input. cuBLAS on the same
+// machine ranged over 3072-6160 GFLOP/s for the same reason.
+//
+// So: warm up by wall-clock time rather than by launch count, and report the
+// median of several timed blocks plus the observed spread, so a run that is
+// still unstable says so in its own output instead of looking authoritative.
+#define WARMUP_MS 1500.0
+#define ITERS     20
+#define REPEATS   5
+
+template <typename LaunchFn>
+static float benchmarkMs(LaunchFn launch, float* spreadPct) {
+    auto t0 = std::chrono::steady_clock::now();
+    do {
+        launch();
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } while (std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t0).count() < WARMUP_MS);
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    std::vector<float> samples;
+    for (int r = 0; r < REPEATS; ++r) {
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < ITERS; ++i) launch();
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        samples.push_back(ms / ITERS);
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    std::sort(samples.begin(), samples.end());
+    float median = samples[REPEATS / 2];
+    if (spreadPct) *spreadPct = 100.0f * (samples.back() - samples.front()) / median;
+    return median;
+}
 
 #define D 64        // head dimension
 #define TILE_N 32   // keys/values processed per tile (also blockDim.x)
@@ -39,8 +90,15 @@ __global__ void flashAttentionSimplified(const float* __restrict__ Q,
     int tid = threadIdx.x; // 0..TILE_N-1, also "which key in the tile" this thread loads/scores
 
     __shared__ float Qs[D];
-    __shared__ float Ks[TILE_N][D];
-    __shared__ float Vs[TILE_N][D];
+    // Padded to D + 1 to break a 32-way shared-memory bank conflict on the
+    // cooperative load below. Thread `tid` writes Ks[tid][c]; at word address
+    // tid*D + c with D = 64 the bank is (tid*64 + c) % 32 == c % 32 -- the
+    // same bank for all 32 lanes, so every write serializes 32 ways. Padding
+    // to 65 makes it (tid + c) % 32, which spreads across all 32 banks.
+    // (Note the accumulation read Vs[j][c] further down was never conflicted:
+    // lanes there share j and differ in c, so they already hit 32 banks.)
+    __shared__ float Ks[TILE_N][D + 1];
+    __shared__ float Vs[TILE_N][D + 1];
     __shared__ float p[TILE_N];        // exp(score - running_max) for the current tile
     __shared__ float acc[D];           // running output accumulator (unnormalized)
     __shared__ float reduceBuf[TILE_N];
@@ -181,16 +239,11 @@ int main() {
     dim3 grid(N);
     dim3 block(TILE_N);
 
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start));
-    flashAttentionSimplified<<<grid, block>>>(d_Q, d_K, d_V, d_O, N, scale);
+    float msSpread = 0.0f;
+    float ms = benchmarkMs([&]{
+        flashAttentionSimplified<<<grid, block>>>(d_Q, d_K, d_V, d_O, N, scale);
+    }, &msSpread);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
 
     CUDA_CHECK(cudaMemcpy(h_O, d_O, bytes, cudaMemcpyDeviceToHost));
 
@@ -201,11 +254,12 @@ int main() {
         maxErr = fmax(maxErr, fabs((double)h_O[i] - (double)h_O_ref[i]));
 
     printf("N (seq len) = %d, D (head dim) = %d, TILE_N = %d\n", N, D, TILE_N);
-    printf("Fused attention kernel time: %.3f ms\n", ms);
+    printf("Fused attention kernel time: %.3f ms  [median of %d, spread %.1f%%]\n",
+           ms, REPEATS, msSpread);
     printf("Max error vs unfused CPU reference: %e\n", maxErr);
     printf(maxErr < 1e-3 ? "PASSED\n" : "FAILED\n");
     printf("Peak shared memory per block: ~%.1f KB (well under the 48KB default limit)\n",
-           (2.0 * TILE_N * D * sizeof(float) + D * sizeof(float) * 2 + TILE_N * sizeof(float) * 2) / 1024.0);
+           (2.0 * TILE_N * (D + 1) * sizeof(float) + D * sizeof(float) * 2 + TILE_N * sizeof(float) * 2) / 1024.0);
 
     CUDA_CHECK(cudaFree(d_Q));
     CUDA_CHECK(cudaFree(d_K));
